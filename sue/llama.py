@@ -1,15 +1,16 @@
-"""Safe llama-cli subprocess runner with streaming."""
+"""Llama.cpp backend. Never hands the TTY to llama-cli's REPL."""
 
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Iterator
 
 from sue.config import SueConfig
-from sue.exceptions import BinaryNotFound, LlamaError, ModelNotFound
+from sue.exceptions import BinaryNotFound, ModelNotFound
 
 
 def find_binary(name: str) -> str | None:
@@ -25,18 +26,19 @@ class LlamaRunner:
         self.proc: subprocess.Popen | None = None
 
     def resolve_binary(self) -> str:
-        b = find_binary(self.cfg.llama_binary)
-        if not b:
-            for alt in ("llama-cli", "llama-completion", "main", "llama"):
-                b = find_binary(alt)
-                if b:
-                    break
-        if not b:
-            raise BinaryNotFound(
-                f"llama.cpp executable not found ({self.cfg.llama_binary}). "
-                "Install llama.cpp and put llama-cli on PATH, or set llama_binary."
-            )
-        return b
+        preferred = [self.cfg.llama_binary, "llama-completion", "llama-cli", "main", "llama"]
+        seen = set()
+        for name in preferred:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            b = find_binary(name)
+            if b:
+                return b
+        raise BinaryNotFound(
+            f"llama.cpp executable not found ({self.cfg.llama_binary}). "
+            "Install llama.cpp (llama-completion or llama-cli) and put it on PATH."
+        )
 
     def resolve_model(self) -> Path:
         p = self.cfg.model_path()
@@ -44,34 +46,64 @@ class LlamaRunner:
             raise ModelNotFound(f"GGUF model not found: {p}")
         return p
 
-    def build_args(self, prompt: str) -> list[str]:
+    def build_args(self, prompt_file: str) -> list[str]:
         return [
             self.resolve_binary(),
             "-m", str(self.resolve_model()),
-            "-p", prompt,
+            "-f", prompt_file,
             "-n", str(self.cfg.max_tokens),
             "-c", str(self.cfg.context_size),
             "--temp", str(self.cfg.temperature),
             "--top-p", str(self.cfg.top_p),
             "--top-k", str(self.cfg.top_k),
             "--repeat-penalty", str(self.cfg.repeat_penalty),
-            "-ngl", "0",
             "--no-display-prompt",
+            "-st",
+            "-no-cnv",
+            "--no-conversation",
         ]
 
     def generate(self, prompt: str) -> Iterator[str]:
-        args = self.build_args(prompt)
-        self.proc = subprocess.Popen(
-            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
-        )
-        assert self.proc.stdout
+        fd, path = tempfile.mkstemp(prefix="sue-prompt-", suffix=".txt")
         try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(prompt)
+            args = self.build_args(path)
+            self.proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            assert self.proc.stdout
+            buf = ""
             while True:
                 ch = self.proc.stdout.read(1)
                 if not ch:
                     break
-                yield ch
+                buf += ch
+                if ch in ("\n", " "):
+                    low = buf.lower()
+                    if any(n in low for n in ("available commands", "interactive mode")):
+                        buf = ""
+                        continue
+                    if buf.strip() in ("/exit", "/regen", "/clear", "/read", "/glob"):
+                        buf = ""
+                        continue
+                    yield buf
+                    buf = ""
+                elif len(buf) > 24:
+                    yield buf
+                    buf = ""
+            if buf:
+                yield buf
         finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
             self.terminate()
 
     def terminate(self) -> None:
