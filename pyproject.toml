@@ -1,0 +1,9 @@
+[project]
+name = "sue-cli"
+version = "1.0.0"
+description = "Matrix-style llama.cpp CLI wrapper (SUE)"
+requires-python = ">=3.9"
+readme = "README.md"
+
+[project.scripts]
+sue = "sue.main:main"

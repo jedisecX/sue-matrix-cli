@@ -1,0 +1,3 @@
+# Optional. SUE runs on the Python standard library.
+# PyYAML is used if present for ~/.config/sue/config.yaml
+# PyYAML>=6.0
